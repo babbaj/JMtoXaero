@@ -1,18 +1,17 @@
 package com.github.entropy5;
 
 import java.io.*;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Instant;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -21,7 +20,7 @@ public class XaeroRegionMerger {
 
     public static final HashSet<Integer> GREENS = new HashSet<>(Arrays.asList(2, 161, 49170, 24594, 32929, 8210, 18, 57362, 53409, 4257, 16402, 20641, 49313, 32786, 37025, 16545, 40978));
 //    static boolean dark = false;
-    public static void main(String[] args) {
+    public static void main(String[] args) throws IOException {
         if (args.length != 5) {
             System.out.println("Usage: java -jar XaeroRegionMerger.jar <top folder> <bottom folder> <out folder> <cores (int)> <darken (0/1)>");
             System.out.println("- This command will merge the zip files from two xaero folders and save them in a third folder");
@@ -29,11 +28,10 @@ public class XaeroRegionMerger {
             System.out.println("- Darkening makes the bottom folder less bright, so you can mark background map data as *undiscovered*");
             throw new RuntimeException("Incorrect number of arguments");
         }
-        final Instant before = Instant.now();
         // First folder gets pixel priority, put the important stuff here
-        Path firstFolderIn = new File(args[0]).toPath();
-        Path secondFolderIn = new File(args[1]).toPath();
-        Path folderOut = new File(args[2]).toPath();
+        Path firstFolderIn = Paths.get(args[0]);
+        Path secondFolderIn = Paths.get(args[1]);
+        Path folderOut = Paths.get(args[2]);
         int parallelism = Integer.parseInt(args[3]);
         boolean dark = (Integer.parseInt(args[4]) == 1);  // stain the background darker
 
@@ -43,8 +41,31 @@ public class XaeroRegionMerger {
         System.out.println("Threads: " + parallelism);
         System.out.println("Darkening: " + dark);
 
-        HashSet<String> firstSet = getFileNames(firstFolderIn);
-        HashSet<String> secondSet = getFileNames(secondFolderIn);
+        mkdir(folderOut);
+        final Set<String> dims = getSubDirs(firstFolderIn);
+        dims.addAll(getSubDirs(secondFolderIn));
+        for (String dim : dims) {
+            final String folder = dim + "/mw$default";
+            final Path out = folderOut.resolve(folder);
+            mkdir(out);
+            final Path top = firstFolderIn.resolve(folder);
+            final Path bottom = secondFolderIn.resolve(folder);
+            if (Files.exists(top) && Files.exists(bottom)) {
+                mergeDimensions(top, bottom, out, parallelism, dark);
+            } else {
+                if (Files.exists(top)) {
+                    copyDir(top, out);
+                } else if (Files.exists(bottom)) {
+                    copyDir(bottom, out);
+                }
+            }
+        }
+    }
+
+    private static void mergeDimensions(Path firstFolderIn, Path secondFolderIn, Path folderOut, int threads, boolean dark) throws IOException {
+        final Instant before = Instant.now();
+        Set<String> firstSet = getFileNames(firstFolderIn);
+        Set<String> secondSet = getFileNames(secondFolderIn);
 
         HashSet<String> onlyFirst = new HashSet<>(firstSet);
         onlyFirst.removeAll(secondSet);  // Difference
@@ -55,7 +76,7 @@ public class XaeroRegionMerger {
         onlySecond.removeAll(firstSet);  // Difference
         System.out.println("Only present in second: " + onlySecond);
         if (dark) {
-            deepMerge(secondFolderIn, secondFolderIn, folderOut, onlySecond, false, parallelism, true);
+            deepMerge(secondFolderIn, secondFolderIn, folderOut, onlySecond, false, threads, true);
         } else {
             copyFull(secondFolderIn, folderOut, onlySecond);
         }
@@ -66,7 +87,7 @@ public class XaeroRegionMerger {
         HashSet<String> inter = new HashSet<>(firstSet);
         inter.retainAll(secondSet);  // Intersection
         System.out.println("Need to deep merge: " + inter);
-        deepMerge(firstFolderIn, secondFolderIn, folderOut, inter, true, parallelism, dark);
+        deepMerge(firstFolderIn, secondFolderIn, folderOut, inter, true, threads, dark);
         Instant afterChunkMerge = Instant.now();
         long secondsToDeepMerge = afterChunkMerge.getEpochSecond() - before.getEpochSecond();
         System.out.println("Completed deep merge in: " + (secondsToDeepMerge / 60) + " minutes");
@@ -390,23 +411,39 @@ public class XaeroRegionMerger {
     }
 
 
-    private static void copyFull(Path folderIn, Path folderOut, HashSet<String> regionSet) {
+    private static void copyFull(Path folderIn, Path folderOut, HashSet<String> regionSet) throws IOException {
         System.out.println("Copying " + regionSet.size() + " regions");
         for (String s : regionSet) {
             try {
-                Files.copy(folderIn.resolve(s), folderOut.resolve(s),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            } catch (Exception e) {
-                e.printStackTrace();
+                Files.copy(folderIn.resolve(s), folderOut.resolve(s), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (Exception ex) {
+                throw ex;
             }
         }
     }
 
-    private static HashSet<String> getFileNames(Path folder) {
-        HashSet<String> nameSet = new HashSet<>();
-        Arrays.stream(Objects.requireNonNull(folder.toFile().listFiles()))
-                .forEach(fileIn -> nameSet.add(fileIn.getName()));
-        return nameSet;
+
+    private static void copyDir(Path from, Path to) throws IOException {
+        try (Stream<Path> ls = Files.list(from)) {
+            for (Path p : (Iterable<Path>)ls::iterator) {
+                Files.copy(p, to.resolve(p.getFileName()));
+            }
+        }
+    }
+    private static void mkdir(Path p) throws IOException{
+        try {
+            Files.createDirectories(p);
+        } catch (FileAlreadyExistsException ex) {}
+    }
+    private static Set<String> getSubDirs(Path folder) throws IOException {
+        try (Stream<Path> ls = Files.list(folder)) {
+            return ls.filter(Files::isDirectory).map(p -> p.getFileName().toString()).collect(Collectors.toSet());
+        }
+    }
+    private static Set<String> getFileNames(Path folder) throws IOException {
+        try (Stream<Path> ls = Files.list(folder)) {
+            return ls.filter(Files::isRegularFile).map(p -> p.getFileName().toString()).collect(Collectors.toSet());
+        }
     }
 
     enum Process {
